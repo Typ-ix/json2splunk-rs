@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use log::{debug, error, info, warn};
 use serde::Deserialize;
@@ -150,7 +151,10 @@ impl Json2Splunk {
     
         // 4. Build the shared event context (metadata: source, sourcetype, host, etc.)
         let ctx = Arc::new(Self::build_event_context(file_tuples, &path));
-    
+        
+        // Create an atomic counter to count the number of events sent for this file.
+        let event_count = Arc::new(AtomicU64::new(0));
+
         // 5. Compile the VRL normalization chain for this file type
         let vrl_chain: Arc<VrlChain> =
             Arc::new(compile_vrl_chain(self.vrl_dir.as_deref(), &file_tuples.normalize));
@@ -278,7 +282,8 @@ impl Json2Splunk {
             let rx = rx.clone();
             let ctx = Arc::clone(&ctx);
             let vrl_chain = Arc::clone(&vrl_chain);
-    
+            let event_count = Arc::clone(&event_count);
+
             // 12.1 Only clone write channel if writer thread exists
             let write_tx = if writer_handle.is_some() {
                 Some(write_tx.clone())
@@ -347,6 +352,8 @@ impl Json2Splunk {
                     if let Some(ref mut hec) = hec_client {
                         let payload = Json2Splunk::build_payload(record, &ctx);
                         hec.batch_event(payload);
+                            // Increment the total event counter whenever an event is sent
+                            event_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
     
@@ -375,6 +382,19 @@ impl Json2Splunk {
     
         // 22. Log completion
         info!("Finished {} file {:?}", file_kind_label, path);
+
+        // If Splunk HEC is configured, send a summary event with the expected count.
+        if let Some(ref hec_template) = hec_template {
+            let total = event_count.load(Ordering::Relaxed);
+            let summary_record = json!({
+                "expected_event_count": total,
+                "event_type": "ingestion_metadata",
+            });
+            let payload = Json2Splunk::build_payload(summary_record, &ctx);
+            let mut hec = hec_template.clone();
+            hec.batch_event(payload);
+            hec.flush_batch();
+        }
     }
     
 
@@ -412,6 +432,9 @@ impl Json2Splunk {
         // 4. Build shared event context (host/source/sourcetype/artifact...)
         let ctx = Arc::new(Self::build_event_context(file_tuples, &path));
     
+        // Create an atomic counter to count the number of events sent for this file.
+        let event_count = Arc::new(AtomicU64::new(0));
+
         // 5. Compile VRL normalization chain for this CSV file (if any)
         let vrl_chain: Arc<VrlChain> =
             Arc::new(compile_vrl_chain(self.vrl_dir.as_deref(), &file_tuples.normalize));
@@ -546,7 +569,8 @@ impl Json2Splunk {
             let ctx = Arc::clone(&ctx);
             let vrl_chain = Arc::clone(&vrl_chain);
             let headers = headers.clone(); // each worker gets its own copy of headers
-    
+            let event_count = Arc::clone(&event_count);
+
             // 14.1 Only create a write channel handle if writer thread exists
             let write_tx = if writer_handle.is_some() {
                 Some(write_tx.clone())
@@ -604,7 +628,8 @@ impl Json2Splunk {
                         let payload = Json2Splunk::build_payload(record_val, &ctx);
                         hec.batch_event(payload);
                         local_count += 1;
-    
+                        // Increment the overall event counter
+                        event_count.fetch_add(1, Ordering::Relaxed);
                         // 15.4 Periodically flush batches (every 1000 events)
                         if local_count % 1000 == 0 {
                             hec.flush_batch();
@@ -637,6 +662,19 @@ impl Json2Splunk {
         }
     
         info!("Finished CSV file {:?}", path);
+
+        // Emit a summary event with the expected number of events for this CSV file
+        if let Some(ref hec_template) = hec_template {
+            let total = event_count.load(Ordering::Relaxed);
+            let summary_record = json!({
+                "expected_event_count": total,
+                "event_type": "ingestion_metadata",
+            });
+            let payload = Json2Splunk::build_payload(summary_record, &ctx);
+            let mut hec = hec_template.clone();
+            hec.batch_event(payload);
+            hec.flush_batch();
+        }
     }
 
 
